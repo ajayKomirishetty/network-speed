@@ -6,7 +6,7 @@ use std::sync::{
     mpsc::Sender,
 };
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::iperf::parser::{bits_per_second_from_unit, bytes_from_unit, parse_interval};
 use crate::models::{TestEvent, TestSummary};
@@ -92,17 +92,34 @@ pub fn friendly_error(raw: &str, server: &str, port: u16) -> String {
 }
 
 pub fn run_test(config: IperfConfig, sender: Sender<TestEvent>, cancel: Arc<AtomicBool>) {
-    let result = run_test_internal(config, &sender, &cancel);
+    let result = run_test_internal(config, &sender, &cancel, DEFAULT_TIMEOUTS);
 
     if let Err(error) = result {
         let _ = sender.send(TestEvent::Error(error));
     }
 }
 
+/// Bounds for a single run.
+///
+/// * `connect`: how long to wait for iperf3's control connection before
+///   giving up with a "could not connect" error.
+/// * `hung_grace`: extra time past the requested test duration before a
+///   connected-but-never-exiting child is treated as hung and killed.
+struct RunTimeouts {
+    connect: Duration,
+    hung_grace: Duration,
+}
+
+const DEFAULT_TIMEOUTS: RunTimeouts = RunTimeouts {
+    connect: Duration::from_secs(10),
+    hung_grace: Duration::from_secs(15),
+};
+
 fn run_test_internal(
     config: IperfConfig,
     sender: &Sender<TestEvent>,
     cancel: &Arc<AtomicBool>,
+    timeouts: RunTimeouts,
 ) -> Result<(), String> {
     let mut child = Command::new(&config.executable)
         .args([
@@ -135,6 +152,21 @@ fn run_test_internal(
 
     let _ = sender.send(TestEvent::Started);
 
+    let started_at = Instant::now();
+    // Give up on the control connection quickly: a server that never
+    // answers should produce a precise "could not connect" error, not a
+    // generic timeout much later.
+    let connect_deadline = started_at + timeouts.connect;
+    // Backstop for a run that connects but then never finishes (server
+    // wedges mid-test, packets dropped with no RST, ...).
+    let finish_deadline =
+        started_at + Duration::from_secs(u64::from(config.duration_seconds)) + timeouts.hung_grace;
+
+    // Set when iperf3 reports its control connection ("connected to" on
+    // stdout). Until then the run is still in the connect phase.
+    let connected = Arc::new(AtomicBool::new(false));
+    let connected_flag = Arc::clone(&connected);
+
     let stdout = child
         .stdout
         .take()
@@ -147,6 +179,10 @@ fn run_test_internal(
         let mut lines = Vec::new();
 
         for line in reader.lines().map_while(Result::ok) {
+            if line.contains("connected to") {
+                connected_flag.store(true, Ordering::Relaxed);
+            }
+
             if let Some(sample) = parse_interval(&line) {
                 let _ = stdout_sender.send(TestEvent::Throughput(sample));
             }
@@ -184,6 +220,48 @@ fn run_test_internal(
             let _ = sender.send(TestEvent::Cancelled);
 
             return Ok(());
+        }
+
+        let now = Instant::now();
+
+        // Still no control connection after the connect timeout: the
+        // server isn't answering. Report it precisely instead of waiting
+        // for the generic finish deadline.
+        if !connected.load(Ordering::Relaxed) && now >= connect_deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+
+            let _ = stdout_thread.join();
+            let _ = stderr_thread.join();
+
+            return Err(format!(
+                "Could not connect to {}:{} within {} seconds.\n\
+                 Make sure an iperf3 server is running on that host and port, \
+                 and that no firewall is blocking the connection.",
+                config.server,
+                config.port,
+                timeouts.connect.as_secs()
+            ));
+        }
+
+        // Connected, but iperf3 should have exited by now: treat it as
+        // hung, kill it, and report a timeout instead of leaving the run
+        // stuck.
+        if now >= finish_deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+
+            let _ = stdout_thread.join();
+            let _ = stderr_thread.join();
+
+            return Err(format!(
+                "The test timed out: iperf3 did not finish within {} seconds. \
+                 The server may have stopped responding mid-test. \
+                 Check that an iperf3 server is healthy at {}:{} and try again.",
+                u64::from(config.duration_seconds) + timeouts.hung_grace.as_secs(),
+                config.server,
+                config.port
+            ));
         }
 
         match child.try_wait() {
@@ -604,5 +682,117 @@ mod tests {
             error.contains("Could not connect to 127.0.0.1:52993"),
             "expected friendly connection error, got: {error}"
         );
+    }
+
+    /// A server that never answers the control connection must fail fast
+    /// with a "could not connect" error, not hang until the generic
+    /// finish deadline.
+    #[cfg(unix)]
+    #[test]
+    fn unanswered_server_fails_fast_with_connect_error() {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("voyis-conn-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fake = dir.join("silent-iperf3");
+        let mut script = std::fs::File::create(&fake).unwrap();
+        // Never prints "connected to": simulates a server that answers
+        // nothing and never fails on its own either.
+        writeln!(script, "#!/bin/sh").unwrap();
+        writeln!(script, "exec sleep 60").unwrap();
+        drop(script);
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let (sender, _receiver) = mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        let config = IperfConfig {
+            executable: fake.to_string_lossy().to_string(),
+            server: "127.0.0.6".to_string(),
+            port: 5201,
+            duration_seconds: 10,
+        };
+
+        let timeouts = RunTimeouts {
+            connect: Duration::from_secs(2),
+            hung_grace: Duration::from_secs(60),
+        };
+
+        let started = Instant::now();
+        let result = run_test_internal(config, &sender, &cancel, timeouts);
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < Duration::from_secs(15),
+            "unanswered server must fail at the connect timeout, took {elapsed:?}"
+        );
+
+        let error = result.expect_err("expected a connect error");
+        assert!(
+            error.contains("Could not connect to 127.0.0.6:5201"),
+            "expected connect error, got: {error}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A run that connects but then never finishes must be killed at the
+    /// finish deadline and reported as a timeout.
+    #[cfg(unix)]
+    #[test]
+    fn hung_connected_test_is_killed_and_reports_timeout() {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("voyis-hang-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fake = dir.join("hang-iperf3");
+        let mut script = std::fs::File::create(&fake).unwrap();
+        // Report the control connection, then hang forever: simulates a
+        // server that wedges mid-test.
+        writeln!(script, "#!/bin/sh").unwrap();
+        writeln!(
+            script,
+            "echo '[  5] local 127.0.0.1 port 54321 connected to 127.0.0.1 port 5201'"
+        )
+        .unwrap();
+        writeln!(script, "exec sleep 60").unwrap();
+        drop(script);
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let (sender, _receiver) = mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        let config = IperfConfig {
+            executable: fake.to_string_lossy().to_string(),
+            server: "127.0.0.1".to_string(),
+            port: 5201,
+            duration_seconds: 1,
+        };
+
+        let timeouts = RunTimeouts {
+            connect: Duration::from_secs(5),
+            hung_grace: Duration::from_secs(2),
+        };
+
+        let started = Instant::now();
+        let result = run_test_internal(config, &sender, &cancel, timeouts);
+        let elapsed = started.elapsed();
+
+        // 1s duration + 2s grace: the call must return well before the
+        // 60s sleeper would exit on its own.
+        assert!(
+            elapsed < Duration::from_secs(15),
+            "hung child must be killed promptly, took {elapsed:?}"
+        );
+
+        let error = result.expect_err("expected a timeout error");
+        assert!(
+            error.contains("timed out"),
+            "expected timeout message, got: {error}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -3,6 +3,7 @@ mod iperf;
 mod models;
 mod settings;
 
+use std::path::PathBuf;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -90,6 +91,13 @@ struct NetworkSpeedApp {
     iperf3_path: String,
     iperf3_version: Option<String>,
     iperf3_found: bool,
+    /// The binary that will actually be executed. This is separate from
+    /// `iperf3_path` (the user's text field) so a wrong path is reported
+    /// as an error instead of being silently replaced by auto-detection.
+    resolved_iperf3: Option<PathBuf>,
+    /// Trimmed `iperf3_path` value the last detection ran against, so
+    /// typing in the field re-runs detection exactly when the text changes.
+    last_checked_iperf3: String,
 
     running: bool,
 
@@ -120,6 +128,8 @@ impl Default for NetworkSpeedApp {
             iperf3_path: stored.iperf3_path.unwrap_or_default(),
             iperf3_version: None,
             iperf3_found: false,
+            resolved_iperf3: None,
+            last_checked_iperf3: String::new(),
 
             running: false,
 
@@ -183,48 +193,68 @@ impl NetworkSpeedApp {
         self.test_started_at = None;
     }
 
+    /// Drop a stale error once the user edits the configuration, so a
+    /// previous failure (e.g. a bad port) does not linger after the input
+    /// that caused it has been fixed.
+    fn clear_error_state(&mut self) {
+        self.error = None;
+        if !self.running && self.status == "Error" {
+            self.status = "Ready".to_string();
+        }
+    }
+
     /// Re-resolve the iperf3 executable and update the detection state.
-    /// Priority: the path in the text field -> bundled copy -> PATH.
+    ///
+    /// A path typed into the text field is honored as-is: if it does not
+    /// point at a file, detection reports "not found" and the field is
+    /// left untouched so the user sees the error. Auto-detection
+    /// (bundled copy -> PATH) only runs when the field is empty.
     fn refresh_iperf3(&mut self) {
-        let trimmed = self.iperf3_path.trim();
+        let trimmed = self.iperf3_path.trim().to_string();
+        self.last_checked_iperf3 = trimmed.clone();
 
         if !trimmed.is_empty() {
-            let path = std::path::PathBuf::from(trimmed);
+            let path = PathBuf::from(&trimmed);
+
             if path.is_file() {
-                match detect_iperf3(trimmed) {
+                match detect_iperf3(&trimmed) {
                     Ok(version) => {
+                        self.resolved_iperf3 = Some(path);
                         self.iperf3_version = Some(version);
                         self.iperf3_found = true;
-                        return;
                     }
                     Err(_) => {
+                        self.resolved_iperf3 = None;
                         self.iperf3_version = None;
                         self.iperf3_found = false;
-                        return;
                     }
                 }
+            } else {
+                // Explicit but invalid: surface an error, never fall back
+                // to the auto-detected binary behind the user's back.
+                self.resolved_iperf3 = None;
+                self.iperf3_version = None;
+                self.iperf3_found = false;
             }
+
+            return;
         }
 
         match resolve_iperf3(None) {
-            Some(path) => {
-                let resolved = path.to_string_lossy().to_string();
-                match detect_iperf3(&resolved) {
-                    Ok(version) => {
-                        // Show the effective binary so the user sees what runs.
-                        // This fallback discovery is not persisted as a custom
-                        // path; it is re-resolved on every startup.
-                        self.iperf3_path = resolved;
-                        self.iperf3_version = Some(version);
-                        self.iperf3_found = true;
-                    }
-                    Err(_) => {
-                        self.iperf3_version = None;
-                        self.iperf3_found = false;
-                    }
+            Some(path) => match detect_iperf3(&path.to_string_lossy()) {
+                Ok(version) => {
+                    self.resolved_iperf3 = Some(path);
+                    self.iperf3_version = Some(version);
+                    self.iperf3_found = true;
                 }
-            }
+                Err(_) => {
+                    self.resolved_iperf3 = None;
+                    self.iperf3_version = None;
+                    self.iperf3_found = false;
+                }
+            },
             None => {
+                self.resolved_iperf3 = None;
                 self.iperf3_version = None;
                 self.iperf3_found = false;
             }
@@ -244,39 +274,71 @@ impl NetworkSpeedApp {
         .save();
     }
 
+    /// Pure field checks, shared by the inline form hints and `validate()`
+    /// so the messages stay identical in both places.
+    fn server_error(&self) -> Option<String> {
+        if self.server.trim().is_empty() {
+            Some("Server is required.".to_string())
+        } else {
+            None
+        }
+    }
+
+    fn port_error(&self) -> Option<String> {
+        match self.port.trim().parse::<u16>() {
+            Ok(port) if port > 0 => None,
+            _ => Some(format!(
+                "\"{}\" is not a valid port. Enter a number from 1 to 65535.",
+                self.port.trim()
+            )),
+        }
+    }
+
+    fn duration_error(&self) -> Option<String> {
+        match self.duration.trim().parse::<u32>() {
+            Ok(duration) if duration > 0 => None,
+            _ => Some(format!(
+                "\"{}\" is not a valid duration. Enter a whole number of seconds greater than 0.",
+                self.duration.trim()
+            )),
+        }
+    }
+
+    fn iperf3_error(&self) -> Option<String> {
+        if self.iperf3_found {
+            return None;
+        }
+
+        let custom = self.iperf3_path.trim();
+
+        if custom.is_empty() {
+            Some(
+                "iperf3 was not found. Install iperf3 or choose its location with Browse."
+                    .to_string(),
+            )
+        } else {
+            Some(format!(
+                "iperf3 was not found at \"{custom}\". Fix the path or clear the field to auto-detect."
+            ))
+        }
+    }
+
     fn validate(&mut self) -> Option<(u16, u32)> {
         self.refresh_iperf3();
 
-        let server = self.server.trim();
-
-        if server.is_empty() {
-            self.error = Some("Server is required.".to_string());
+        if let Some(error) = self
+            .server_error()
+            .or_else(|| self.port_error())
+            .or_else(|| self.duration_error())
+            .or_else(|| self.iperf3_error())
+        {
+            self.error = Some(error);
             return None;
         }
 
-        let port = match self.port.trim().parse::<u16>() {
-            Ok(port) if port > 0 => port,
-            _ => {
-                self.error = Some("Port must be between 1 and 65535.".to_string());
-                return None;
-            }
-        };
-
-        let duration = match self.duration.trim().parse::<u32>() {
-            Ok(duration) if duration > 0 => duration,
-            _ => {
-                self.error = Some("Duration must be greater than 0.".to_string());
-                return None;
-            }
-        };
-
-        if !self.iperf3_found {
-            self.error = Some(
-                "iperf3 was not found. Install iperf3 or choose its location with Browse."
-                    .to_string(),
-            );
-            return None;
-        }
+        // The checks above already parsed these successfully.
+        let port = self.port.trim().parse::<u16>().ok()?;
+        let duration = self.duration.trim().parse::<u32>().ok()?;
 
         Some((port, duration))
     }
@@ -291,8 +353,16 @@ impl NetworkSpeedApp {
         let cancel = Arc::new(AtomicBool::new(false));
         let worker_cancel = Arc::clone(&cancel);
 
+        // `validate()` guarantees detection succeeded, so this is always
+        // `Some` here; fall back to the raw field only defensively.
+        let executable = self
+            .resolved_iperf3
+            .as_ref()
+            .map(|path| path.to_string_lossy().to_string())
+            .unwrap_or_else(|| self.iperf3_path.trim().to_string());
+
         let config = IperfConfig {
-            executable: self.iperf3_path.trim().to_string(),
+            executable,
             server: self.server.trim().to_string(),
             port,
             duration_seconds: duration,
@@ -465,26 +535,62 @@ impl NetworkSpeedApp {
     }
 
     fn show_configuration(&mut self, ui: &mut egui::Ui) {
+        // Re-run detection when the path text changed since the last check,
+        // so typing a wrong path immediately surfaces an error instead of
+        // silently falling back to the auto-detected binary.
+        if self.iperf3_path.trim() != self.last_checked_iperf3 {
+            self.refresh_iperf3();
+        }
+
         ui.label(section_title("Test Configuration"));
         ui.add_space(12.0);
 
+        // If the user edits any field after an error, the old error is
+        // stale: clear it (and the Error pill) so fixed inputs read as
+        // Ready again.
+        let mut inputs_changed = false;
+
         ui.add_enabled_ui(!self.running, |ui| {
             ui.label(field_label("SERVER"));
-            ui.add(egui::TextEdit::singleline(&mut self.server).desired_width(f32::INFINITY));
+            if ui
+                .add(egui::TextEdit::singleline(&mut self.server).desired_width(f32::INFINITY))
+                .changed()
+            {
+                inputs_changed = true;
+            }
+            if let Some(hint) = self.server_error() {
+                ui.label(egui::RichText::new(hint).small().color(DANGER));
+            }
             ui.add_space(10.0);
 
             ui.horizontal(|ui| {
                 ui.vertical(|ui| {
                     ui.label(field_label("PORT"));
-                    ui.add(egui::TextEdit::singleline(&mut self.port).desired_width(110.0));
+                    if ui
+                        .add(egui::TextEdit::singleline(&mut self.port).desired_width(110.0))
+                        .changed()
+                    {
+                        inputs_changed = true;
+                    }
+                    if let Some(hint) = self.port_error() {
+                        ui.label(egui::RichText::new(hint).small().color(DANGER));
+                    }
                 });
                 ui.add_space(12.0);
                 ui.vertical(|ui| {
                     ui.label(field_label("DURATION"));
                     ui.horizontal(|ui| {
-                        ui.add(egui::TextEdit::singleline(&mut self.duration).desired_width(80.0));
+                        if ui
+                            .add(egui::TextEdit::singleline(&mut self.duration).desired_width(80.0))
+                            .changed()
+                        {
+                            inputs_changed = true;
+                        }
                         ui.label(egui::RichText::new("seconds").color(TEXT_DIM));
                     });
+                    if let Some(hint) = self.duration_error() {
+                        ui.label(egui::RichText::new(hint).small().color(DANGER));
+                    }
                 });
             });
             ui.add_space(10.0);
@@ -492,31 +598,68 @@ impl NetworkSpeedApp {
             ui.label(field_label("IPERF3 EXECUTABLE"));
             ui.horizontal(|ui| {
                 let available = ui.available_width() - 92.0;
-                ui.add(egui::TextEdit::singleline(&mut self.iperf3_path).desired_width(available));
+                if ui
+                    .add(egui::TextEdit::singleline(&mut self.iperf3_path).desired_width(available))
+                    .changed()
+                {
+                    inputs_changed = true;
+                }
                 if ui.button("Browse...").clicked()
                     && let Some(path) = rfd::FileDialog::new().pick_file()
                 {
                     self.iperf3_path = path.to_string_lossy().to_string();
                     self.refresh_iperf3();
                     self.save_iperf3_setting();
+                    self.clear_error_state();
                 }
             });
         });
 
+        if inputs_changed {
+            self.clear_error_state();
+        }
+
         ui.add_space(10.0);
 
-        if let Some(version) = &self.iperf3_version {
+        let custom_path = self.iperf3_path.trim().to_string();
+
+        if self.iperf3_found {
+            let mut status = self
+                .iperf3_version
+                .clone()
+                .unwrap_or_else(|| "iperf3 detected".to_string());
+
+            // When auto-detecting (field empty), show which binary will run.
+            if custom_path.is_empty()
+                && let Some(resolved) = &self.resolved_iperf3
+            {
+                status.push_str(&format!("  •  {}", resolved.to_string_lossy()));
+            }
+
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new("●").size(9.0).color(SUCCESS));
-                ui.label(egui::RichText::new(version).small().color(TEXT_DIM));
+                ui.label(egui::RichText::new(status).small().color(TEXT_DIM));
+            });
+        } else if !custom_path.is_empty() {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("●").size(9.0).color(DANGER));
+                ui.label(
+                    egui::RichText::new(format!(
+                        "iperf3 not found at \"{custom_path}\". Fix the path or clear the field to auto-detect."
+                    ))
+                    .small()
+                    .color(DANGER),
+                );
             });
         } else {
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new("●").size(9.0).color(DANGER));
                 ui.label(
-                    egui::RichText::new("iperf3 not detected — pick its location with Browse.")
-                        .small()
-                        .color(DANGER),
+                    egui::RichText::new(
+                        "iperf3 not detected — install it or pick its location with Browse.",
+                    )
+                    .small()
+                    .color(DANGER),
                 );
             });
         }
@@ -538,11 +681,10 @@ impl NetworkSpeedApp {
                 }
             });
             if !self.iperf3_found {
-                ui.label(
-                    egui::RichText::new("Start is disabled until iperf3 is found.")
-                        .small()
-                        .color(TEXT_DIM),
-                );
+                let hint = self
+                    .iperf3_error()
+                    .unwrap_or_else(|| "Start is disabled until iperf3 is found.".to_string());
+                ui.label(egui::RichText::new(hint).small().color(DANGER));
             }
         } else {
             let button = egui::Button::new(
@@ -556,6 +698,25 @@ impl NetworkSpeedApp {
             if ui.add_sized([ui.available_width(), 46.0], button).clicked() {
                 self.cancel_test();
             }
+        }
+
+        // Surface the latest error right under the action button so it is
+        // always visible without scrolling. This covers both validation
+        // failures (e.g. a bad port) and runtime failures (e.g. connection
+        // refused because nothing listens on the chosen port).
+        if let Some(error) = self.error.clone() {
+            ui.add_space(10.0);
+
+            egui::Frame::group(ui.style())
+                .fill(egui::Color32::from_rgb(52, 18, 16))
+                .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(128, 32, 28)))
+                .corner_radius(egui::CornerRadius::same(10))
+                .inner_margin(egui::Margin::same(14))
+                .show(ui, |ui| {
+                    ui.label(
+                        egui::RichText::new(error).color(egui::Color32::from_rgb(255, 180, 170)),
+                    );
+                });
         }
     }
 
@@ -631,13 +792,18 @@ impl NetworkSpeedApp {
             ui.add_space(18.0);
 
             let duration = self.duration.parse::<f32>().unwrap_or(1.0);
-            let progress = (self.elapsed_seconds as f32 / duration).clamp(0.0, 1.0);
+            // Never display more elapsed time than the requested duration,
+            // so a run that overruns (e.g. while a hung iperf3 is being
+            // timed out) doesn't read as "21.8s / 10s".
+            let elapsed = (self.elapsed_seconds as f32).min(duration.max(0.001));
+            let progress = (elapsed / duration).clamp(0.0, 1.0);
 
             let bar = egui::ProgressBar::new(progress)
                 .desired_width(ui.available_width())
                 .desired_height(22.0)
-                .text(format!("{:.1}s / {}s", self.elapsed_seconds, self.duration))
+                .text(format!("{:.1}s / {}s", elapsed, self.duration))
                 .fill(ACCENT);
+
             ui.add(bar);
         }
     }
@@ -779,21 +945,6 @@ impl NetworkSpeedApp {
             self.result_card(&mut columns[3], "RECEIVED", received);
             self.result_card(&mut columns[4], "RETRANSMITS", retransmits);
         });
-
-        if let Some(error) = self.error.clone() {
-            ui.add_space(10.0);
-
-            egui::Frame::group(ui.style())
-                .fill(egui::Color32::from_rgb(52, 18, 16))
-                .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(128, 32, 28)))
-                .corner_radius(egui::CornerRadius::same(10))
-                .inner_margin(egui::Margin::same(14))
-                .show(ui, |ui| {
-                    ui.label(
-                        egui::RichText::new(error).color(egui::Color32::from_rgb(255, 180, 170)),
-                    );
-                });
-        }
     }
 
     fn result_card(&self, ui: &mut egui::Ui, title: &str, value: String) {
@@ -876,4 +1027,162 @@ fn main() -> eframe::Result<()> {
             Ok(Box::new(NetworkSpeedApp::default()))
         }),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_app() -> NetworkSpeedApp {
+        NetworkSpeedApp::default()
+    }
+
+    #[test]
+    fn wrong_iperf3_path_is_reported_not_silently_replaced() {
+        let mut app = test_app();
+        app.iperf3_path = "/definitely/not/here/iperf3".to_string();
+        app.refresh_iperf3();
+
+        assert!(!app.iperf3_found);
+        assert!(app.resolved_iperf3.is_none());
+
+        // The user's text must be preserved, not overwritten with the
+        // auto-detected binary.
+        assert_eq!(app.iperf3_path, "/definitely/not/here/iperf3");
+
+        let error = app.iperf3_error().expect("expected an iperf3 error");
+        assert!(
+            error.contains("/definitely/not/here/iperf3"),
+            "error should name the bad path, got: {error}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_bad_port_with_helpful_message() {
+        let mut app = test_app();
+        app.port = "abc".to_string();
+
+        assert!(app.validate().is_none());
+
+        let error = app.error.clone().expect("expected a validation error");
+        assert!(
+            error.contains("abc"),
+            "error should echo the input: {error}"
+        );
+        assert!(
+            error.contains("1 to 65535"),
+            "error should give the valid range: {error}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_out_of_range_and_zero_ports() {
+        for bad in ["0", "70000", "-1", ""] {
+            let mut app = test_app();
+            app.port = bad.to_string();
+
+            assert!(app.validate().is_none(), "port {bad:?} should be rejected");
+
+            let error = app.error.clone().expect("expected a validation error");
+            assert!(
+                error.contains("1 to 65535"),
+                "port {bad:?}: expected range hint, got: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_rejects_bad_duration_with_helpful_message() {
+        for bad in ["0", "-5", "ten", ""] {
+            let mut app = test_app();
+            app.duration = bad.to_string();
+
+            assert!(
+                app.validate().is_none(),
+                "duration {bad:?} should be rejected"
+            );
+
+            let error = app.error.clone().expect("expected a validation error");
+            assert!(
+                error.contains("duration"),
+                "duration {bad:?}: expected a duration hint, got: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_rejects_empty_server() {
+        let mut app = test_app();
+        app.server = "   ".to_string();
+
+        assert!(app.validate().is_none());
+
+        let error = app.error.clone().expect("expected a validation error");
+        assert!(error.contains("Server is required"), "got: {error}");
+    }
+
+    #[test]
+    fn clearing_error_state_resets_stale_error() {
+        let mut app = test_app();
+        app.error = Some("connection refused".to_string());
+        app.status = "Error".to_string();
+
+        app.clear_error_state();
+
+        assert!(app.error.is_none());
+        assert_eq!(app.status, "Ready");
+    }
+
+    #[test]
+    fn inline_hints_agree_with_validate() {
+        let app = test_app();
+
+        // With default valid values there are no hints.
+        assert!(app.server_error().is_none());
+        assert!(app.port_error().is_none());
+        assert!(app.duration_error().is_none());
+    }
+
+    /// Builds a tiny fake executable (a shell script answering
+    /// `--version`) so detection succeeds without a real iperf3 binary.
+    /// A script is used instead of a system binary like `/bin/true`
+    /// because those are not guaranteed to exist on every Unix
+    /// (macOS ships no `/bin/true`).
+    #[cfg(unix)]
+    #[test]
+    fn validate_accepts_good_input() {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("voyis-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let fake = dir.join("fake-iperf3");
+        let mut script = std::fs::File::create(&fake).expect("create fake iperf3");
+        writeln!(script, "#!/bin/sh").unwrap();
+        writeln!(script, "echo 'iperf 3.21 (fake)'").unwrap();
+        drop(script);
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod fake iperf3");
+
+        let mut app = test_app();
+        app.iperf3_path = fake.to_string_lossy().to_string();
+
+        let result = app.validate();
+
+        assert_eq!(result, Some((5201, 10)));
+        assert!(app.error.is_none());
+        assert!(app.iperf3_found);
+        assert_eq!(
+            app.resolved_iperf3,
+            Some(fake.clone()),
+            "the explicit path must be the resolved binary, not a fallback"
+        );
+        assert_eq!(
+            app.iperf3_version.as_deref(),
+            Some("iperf 3.21 (fake)"),
+            "the version line should come from the fake binary"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
