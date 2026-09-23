@@ -48,128 +48,123 @@ pub fn run_test(config: IperfConfig, sender: Sender<TestEvent>, cancel: Arc<Atom
 }
 
 fn run_test_internal(
-	config: IperfConfig,
-	sender: &Sender<TestEvent>,
-	cancel: &Arc<AtomicBool>,
+    config: IperfConfig,
+    sender: &Sender<TestEvent>,
+    cancel: &Arc<AtomicBool>,
 ) -> Result<(), String> {
-	let mut child = Command::new(&config.executable)
-			.args([
-					"-c",
-					&config.server,
-					"-p",
-					&config.port.to_string(),
-					"-t",
-					&config.duration_seconds.to_string(),
-					"-i",
-					"1",
-			])
-			.stdout(Stdio::piped())
-			.stderr(Stdio::piped())
-			.spawn()
-			.map_err(|error| {
-					format!(
-							"Failed to start iperf3 '{}': {}",
-							config.executable, error
-					)
-			})?;
+    let mut child = Command::new(&config.executable)
+        .args([
+            "-c",
+            &config.server,
+            "-p",
+            &config.port.to_string(),
+            "-t",
+            &config.duration_seconds.to_string(),
+            "-i",
+            "1",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("Failed to start iperf3 '{}': {}", config.executable, error))?;
 
-	let _ = sender.send(TestEvent::Started);
+    let _ = sender.send(TestEvent::Started);
 
-	let stdout = child
-			.stdout
-			.take()
-			.ok_or_else(|| "Failed to capture iperf3 stdout".to_string())?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "Failed to capture iperf3 stdout".to_string())?;
 
-	let stdout_thread = thread::spawn(move || {
-			let reader = BufReader::new(stdout);
+    let stdout_thread = thread::spawn(move || {
+        let reader = BufReader::new(stdout);
 
-			reader.lines().filter_map(Result::ok).collect::<Vec<String>>()
-	});
+        reader
+            .lines()
+            .filter_map(Result::ok)
+            .collect::<Vec<String>>()
+    });
 
-	let stderr = child
-			.stderr
-			.take()
-			.ok_or_else(|| "Failed to capture iperf3 stderr".to_string())?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "Failed to capture iperf3 stderr".to_string())?;
 
-	let stderr_thread = thread::spawn(move || {
-			let reader = BufReader::new(stderr);
+    let stderr_thread = thread::spawn(move || {
+        let reader = BufReader::new(stderr);
 
-			reader
-					.lines()
-					.filter_map(Result::ok)
-					.collect::<Vec<String>>()
-	});
+        reader
+            .lines()
+            .filter_map(Result::ok)
+            .collect::<Vec<String>>()
+    });
 
-	// Poll the process while checking for cancellation.
-	loop {
-			if cancel.load(Ordering::Relaxed) {
-					let _ = child.kill();
-					let _ = child.wait();
+    // Poll the process while checking for cancellation.
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            let _ = child.kill();
+            let _ = child.wait();
 
-					let _ = stdout_thread.join();
-					let _ = stderr_thread.join();
+            let _ = stdout_thread.join();
+            let _ = stderr_thread.join();
 
-					let _ = sender.send(TestEvent::Cancelled);
+            let _ = sender.send(TestEvent::Cancelled);
 
-					return Ok(());
-			}
+            return Ok(());
+        }
 
-			match child.try_wait() {
-					Ok(Some(status)) => {
-							let stdout_lines = stdout_thread.join().unwrap_or_default();
-							let stderr_lines = stderr_thread.join().unwrap_or_default();
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let stdout_lines = stdout_thread.join().unwrap_or_default();
+                let stderr_lines = stderr_thread.join().unwrap_or_default();
 
-							if cancel.load(Ordering::Relaxed) {
-									let _ = sender.send(TestEvent::Cancelled);
-									return Ok(());
-							}
+                if cancel.load(Ordering::Relaxed) {
+                    let _ = sender.send(TestEvent::Cancelled);
+                    return Ok(());
+                }
 
-							let mut summary = TestSummary::default();
+                let mut summary = TestSummary::default();
 
-							for line in stdout_lines {
-									if let Some(sample) = parse_interval(&line) {
-											let _ = sender.send(TestEvent::Throughput(sample));
-									}
+                for line in stdout_lines {
+                    if let Some(sample) = parse_interval(&line) {
+                        let _ = sender.send(TestEvent::Throughput(sample));
+                    }
 
-									parse_summary_line(&line, &mut summary);
-							}
+                    parse_summary_line(&line, &mut summary);
+                }
 
-							if !status.success() {
-									let details = stderr_lines.join("\n");
+                if !status.success() {
+                    let details = stderr_lines.join("\n");
 
-									if details.is_empty() {
-											return Err(format!(
-													"iperf3 exited with non-zero status: {}",
-													status
-											));
-									}
+                    if details.is_empty() {
+                        return Err(format!("iperf3 exited with non-zero status: {}", status));
+                    }
 
-									return Err(format!(
-											"iperf3 exited with non-zero status: {}\n{}",
-											status, details
-									));
-							}
+                    return Err(format!(
+                        "iperf3 exited with non-zero status: {}\n{}",
+                        status, details
+                    ));
+                }
 
-							let _ = sender.send(TestEvent::Finished(summary));
+                let _ = sender.send(TestEvent::Finished(summary));
 
-							return Ok(());
-					}
+                return Ok(());
+            }
 
-					Ok(None) => {
-							thread::sleep(std::time::Duration::from_millis(50));
-					}
+            Ok(None) => {
+                thread::sleep(std::time::Duration::from_millis(50));
+            }
 
-					Err(error) => {
-							let _ = child.kill();
-							let _ = child.wait();
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
 
-							let _ = stdout_thread.join();
-							let _ = stderr_thread.join();
+                let _ = stdout_thread.join();
+                let _ = stderr_thread.join();
 
-							return Err(format!("Failed to check iperf3 process: {}", error));
-					}
-			}
-	}
+                return Err(format!("Failed to check iperf3 process: {}", error));
+            }
+        }
+    }
 }
 
 fn parse_summary_line(line: &str, summary: &mut TestSummary) {
