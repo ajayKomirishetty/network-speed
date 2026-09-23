@@ -48,104 +48,128 @@ pub fn run_test(config: IperfConfig, sender: Sender<TestEvent>, cancel: Arc<Atom
 }
 
 fn run_test_internal(
-    config: IperfConfig,
-    sender: &Sender<TestEvent>,
-    cancel: &Arc<AtomicBool>,
+	config: IperfConfig,
+	sender: &Sender<TestEvent>,
+	cancel: &Arc<AtomicBool>,
 ) -> Result<(), String> {
-    let mut child = Command::new(&config.executable)
-        .args([
-            "-c",
-            &config.server,
-            "-p",
-            &config.port.to_string(),
-            "-t",
-            &config.duration_seconds.to_string(),
-            "-i",
-            "1",
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|error| format!("Failed to start iperf3 '{}': {}", config.executable, error))?;
+	let mut child = Command::new(&config.executable)
+			.args([
+					"-c",
+					&config.server,
+					"-p",
+					&config.port.to_string(),
+					"-t",
+					&config.duration_seconds.to_string(),
+					"-i",
+					"1",
+			])
+			.stdout(Stdio::piped())
+			.stderr(Stdio::piped())
+			.spawn()
+			.map_err(|error| {
+					format!(
+							"Failed to start iperf3 '{}': {}",
+							config.executable, error
+					)
+			})?;
 
-    let _ = sender.send(TestEvent::Started);
+	let _ = sender.send(TestEvent::Started);
 
-    // Read stderr on a separate thread so the stderr pipe
-    // cannot fill up and block the iperf3 process.
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| "Failed to capture iperf3 stderr".to_string())?;
+	let stdout = child
+			.stdout
+			.take()
+			.ok_or_else(|| "Failed to capture iperf3 stdout".to_string())?;
 
-    let stderr_handle = thread::spawn(move || {
-        let reader = BufReader::new(stderr);
+	let stdout_thread = thread::spawn(move || {
+			let reader = BufReader::new(stdout);
 
-        reader
-            .lines()
-            .filter_map(Result::ok)
-            .collect::<Vec<String>>()
-    });
+			reader.lines().filter_map(Result::ok).collect::<Vec<String>>()
+	});
 
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| "Failed to capture iperf3 stdout".to_string())?;
+	let stderr = child
+			.stderr
+			.take()
+			.ok_or_else(|| "Failed to capture iperf3 stderr".to_string())?;
 
-    let reader = BufReader::new(stdout);
+	let stderr_thread = thread::spawn(move || {
+			let reader = BufReader::new(stderr);
 
-    let mut summary = TestSummary::default();
+			reader
+					.lines()
+					.filter_map(Result::ok)
+					.collect::<Vec<String>>()
+	});
 
-    for line in reader.lines() {
-        // Check whether the user requested cancellation.
-        if cancel.load(Ordering::Relaxed) {
-            let _ = child.kill();
+	// Poll the process while checking for cancellation.
+	loop {
+			if cancel.load(Ordering::Relaxed) {
+					let _ = child.kill();
+					let _ = child.wait();
 
-            // Make sure the process is actually reaped.
-            let _ = child.wait();
+					let _ = stdout_thread.join();
+					let _ = stderr_thread.join();
 
-            let _ = stderr_handle.join();
+					let _ = sender.send(TestEvent::Cancelled);
 
-            let _ = sender.send(TestEvent::Cancelled);
+					return Ok(());
+			}
 
-            return Ok(());
-        }
+			match child.try_wait() {
+					Ok(Some(status)) => {
+							let stdout_lines = stdout_thread.join().unwrap_or_default();
+							let stderr_lines = stderr_thread.join().unwrap_or_default();
 
-        let line = line.map_err(|error| format!("Failed to read iperf3 output: {}", error))?;
+							if cancel.load(Ordering::Relaxed) {
+									let _ = sender.send(TestEvent::Cancelled);
+									return Ok(());
+							}
 
-        if let Some(sample) = parse_interval(&line) {
-            let _ = sender.send(TestEvent::Throughput(sample));
-        }
+							let mut summary = TestSummary::default();
 
-        parse_summary_line(&line, &mut summary);
-    }
+							for line in stdout_lines {
+									if let Some(sample) = parse_interval(&line) {
+											let _ = sender.send(TestEvent::Throughput(sample));
+									}
 
-    let status = child
-        .wait()
-        .map_err(|error| format!("Failed to wait for iperf3: {}", error))?;
+									parse_summary_line(&line, &mut summary);
+							}
 
-    let stderr_lines = stderr_handle.join().unwrap_or_default();
+							if !status.success() {
+									let details = stderr_lines.join("\n");
 
-    if cancel.load(Ordering::Relaxed) {
-        let _ = sender.send(TestEvent::Cancelled);
-        return Ok(());
-    }
+									if details.is_empty() {
+											return Err(format!(
+													"iperf3 exited with non-zero status: {}",
+													status
+											));
+									}
 
-    if !status.success() {
-        let details = stderr_lines.join("\n");
+									return Err(format!(
+											"iperf3 exited with non-zero status: {}\n{}",
+											status, details
+									));
+							}
 
-        if details.is_empty() {
-            return Err(format!("iperf3 exited with non-zero status: {}", status));
-        }
+							let _ = sender.send(TestEvent::Finished(summary));
 
-        return Err(format!(
-            "iperf3 exited with non-zero status: {}\n{}",
-            status, details
-        ));
-    }
+							return Ok(());
+					}
 
-    let _ = sender.send(TestEvent::Finished(summary));
+					Ok(None) => {
+							thread::sleep(std::time::Duration::from_millis(50));
+					}
 
-    Ok(())
+					Err(error) => {
+							let _ = child.kill();
+							let _ = child.wait();
+
+							let _ = stdout_thread.join();
+							let _ = stderr_thread.join();
+
+							return Err(format!("Failed to check iperf3 process: {}", error));
+					}
+			}
+	}
 }
 
 fn parse_summary_line(line: &str, summary: &mut TestSummary) {

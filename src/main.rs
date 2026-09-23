@@ -68,21 +68,58 @@ impl Default for NetworkSpeedApp {
 }
 
 impl NetworkSpeedApp {
-    fn start_test(&mut self) {
-        let port = match self.port.parse::<u16>() {
-            Ok(port) => port,
-            Err(_) => {
-                self.error = Some("Port must be a valid number.".to_string());
-                return;
+    fn format_speed(mbps: f64) -> String {
+        if mbps >= 1000.0 {
+            format!("{:.2} Gbps", mbps / 1000.0)
+        } else {
+            format!("{:.2} Mbps", mbps)
+        }
+    }
+
+    fn reset_results(&mut self) {
+        self.samples.clear();
+        self.current_mbps = 0.0;
+        self.sender_mbps = None;
+        self.receiver_mbps = None;
+        self.total_bytes = None;
+        self.retransmits = None;
+        self.error = None;
+    }
+
+    fn validate(&mut self) -> Option<(u16, u32)> {
+        let server = self.server.trim();
+
+        if server.is_empty() {
+            self.error = Some("Server is required.".to_string());
+            return None;
+        }
+
+        let port = match self.port.trim().parse::<u16>() {
+            Ok(port) if port > 0 => port,
+            _ => {
+                self.error = Some("Port must be between 1 and 65535.".to_string());
+                return None;
             }
         };
 
-        let duration = match self.duration.parse::<u32>() {
+        let duration = match self.duration.trim().parse::<u32>() {
             Ok(duration) if duration > 0 => duration,
             _ => {
                 self.error = Some("Duration must be greater than 0.".to_string());
-                return;
+                return None;
             }
+        };
+
+        if self.iperf3_path.trim().is_empty() {
+            self.error = Some("iperf3 path is required.".to_string());
+            return None;
+        }
+
+        Some((port, duration))
+    }
+    fn start_test(&mut self) {
+        let Some((port, duration)) = self.validate() else {
+            return;
         };
 
         let (sender, receiver) = mpsc::channel();
@@ -91,11 +128,13 @@ impl NetworkSpeedApp {
         let worker_cancel = Arc::clone(&cancel);
 
         let config = IperfConfig {
-            executable: self.iperf3_path.clone(),
-            server: self.server.clone(),
+            executable: self.iperf3_path.trim().to_string(),
+            server: self.server.trim().to_string(),
             port,
             duration_seconds: duration,
         };
+
+        self.reset_results();
 
         thread::spawn(move || {
             run_test(config, sender, worker_cancel);
@@ -103,18 +142,7 @@ impl NetworkSpeedApp {
 
         self.receiver = Some(receiver);
         self.cancel = Some(cancel);
-
-        self.samples.clear();
-
-        self.current_mbps = 0.0;
-        self.sender_mbps = None;
-        self.receiver_mbps = None;
-        self.total_bytes = None;
-        self.retransmits = None;
-
-        self.error = None;
         self.status = "Starting...".to_string();
-
         self.running = true;
     }
 
@@ -237,7 +265,10 @@ impl eframe::App for NetworkSpeedApp {
 
         ui.heading("Live Throughput");
 
-        ui.label(format!("Current: {:.2} Mbps", self.current_mbps));
+        ui.label(format!(
+            "Current: {}",
+            Self::format_speed(self.current_mbps)
+        ));
 
         if !self.samples.is_empty() {
             let points: PlotPoints = self
@@ -262,11 +293,11 @@ impl eframe::App for NetworkSpeedApp {
         ui.heading("Summary");
 
         if let Some(value) = self.sender_mbps {
-            ui.label(format!("Sender: {:.2} Mbps", value));
+            ui.label(format!("Sender: {}", Self::format_speed(value)));
         }
 
         if let Some(value) = self.receiver_mbps {
-            ui.label(format!("Receiver: {:.2} Mbps", value));
+            ui.label(format!("Receiver: {}", Self::format_speed(value)));
         }
 
         if let Some(bytes) = self.total_bytes {
