@@ -11,7 +11,8 @@ pub struct ThroughputSample {
 pub struct TestSummary {
     pub sender_bits_per_second: Option<f64>,
     pub receiver_bits_per_second: Option<f64>,
-    pub total_bytes: Option<u64>,
+    pub sent_bytes: Option<u64>,
+    pub received_bytes: Option<u64>,
     pub retransmits: Option<u64>,
 }
 

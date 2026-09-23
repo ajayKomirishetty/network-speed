@@ -51,24 +51,26 @@ fn parse_interval_range(value: &str) -> Option<(f64, f64)> {
     Some((start, end))
 }
 
-fn bytes_from_unit(value: f64, unit: &str) -> Option<u64> {
+pub(crate) fn bytes_from_unit(value: f64, unit: &str) -> Option<u64> {
     let multiplier = match unit {
         "Bytes" => 1.0,
         "KBytes" => 1024.0,
         "MBytes" => 1024.0 * 1024.0,
         "GBytes" => 1024.0 * 1024.0 * 1024.0,
+        "TBytes" => 1024.0 * 1024.0 * 1024.0 * 1024.0,
         _ => return None,
     };
 
     Some((value * multiplier) as u64)
 }
 
-fn bits_per_second_from_unit(value: f64, unit: &str) -> Option<f64> {
+pub(crate) fn bits_per_second_from_unit(value: f64, unit: &str) -> Option<f64> {
     let multiplier = match unit {
         "bits/sec" => 1.0,
         "Kbits/sec" => 1_000.0,
         "Mbits/sec" => 1_000_000.0,
         "Gbits/sec" => 1_000_000_000.0,
+        "Tbits/sec" => 1_000_000_000_000.0,
         _ => return None,
     };
 
@@ -125,6 +127,31 @@ mod tests {
 
         assert_eq!(sample.transfer_bytes, 1000);
         assert_eq!(sample.bits_per_second, 800.0);
+    }
+
+    #[test]
+    fn parses_terabyte_interval() {
+        let line = "[  5]   0.00-1.00   sec  1.50 TBytes   12.5 Tbits/sec    3";
+
+        let sample = parse_interval(line).expect("expected interval to parse");
+
+        assert_eq!(
+            sample.transfer_bytes,
+            (1.5 * 1024.0 * 1024.0 * 1024.0 * 1024.0) as u64
+        );
+        assert_eq!(sample.bits_per_second, 12_500_000_000_000.0);
+        assert_eq!(sample.retransmits, Some(3));
+    }
+
+    #[test]
+    fn parses_receiver_interval_without_retransmit_column() {
+        // Receiver-side interval lines carry no retransmit/cwnd columns.
+        let line = "[  5]   0.00-1.00   sec  1.10 MBytes  9.24 Mbits/sec";
+
+        let sample = parse_interval(line).expect("expected interval to parse");
+
+        assert_eq!(sample.bits_per_second, 9_240_000.0);
+        assert_eq!(sample.retransmits, None);
     }
 
     #[test]

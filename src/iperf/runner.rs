@@ -1,5 +1,5 @@
 use std::io::{BufRead, BufReader};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -8,7 +8,7 @@ use std::sync::{
 use std::thread;
 use std::time::Duration;
 
-use crate::iperf::parser::parse_interval;
+use crate::iperf::parser::{bits_per_second_from_unit, bytes_from_unit, parse_interval};
 use crate::models::{TestEvent, TestSummary};
 
 pub struct IperfConfig {
@@ -22,7 +22,16 @@ pub fn detect_iperf3(executable: &str) -> Result<String, String> {
     let output = Command::new(executable)
         .arg("--version")
         .output()
-        .map_err(|error| format!("Unable to find iperf3 '{}': {}", executable, error))?;
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                format!(
+                    "iperf3 was not found at '{}'. Install iperf3 or set the correct path.",
+                    executable
+                )
+            } else {
+                format!("Unable to run iperf3 '{}': {}", executable, error)
+            }
+        })?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -38,6 +47,48 @@ pub fn detect_iperf3(executable: &str) -> Result<String, String> {
         .to_string();
 
     Ok(version)
+}
+
+/// Translate raw iperf3 stderr text into a message that helps a
+/// non-technical user understand what went wrong and what to try next.
+pub fn friendly_error(raw: &str, server: &str, port: u16) -> String {
+    let lower = raw.to_lowercase();
+
+    // Check the specific causes before the generic "unable to connect"
+    // prefix that iperf3 uses for all of these.
+    if lower.contains("name or service not known")
+        || lower.contains("temporary failure in name resolution")
+        || lower.contains("nodename nor servname")
+    {
+        format!(
+            "Could not resolve the server name \"{server}\".\n\
+             Check the spelling or use an IP address instead.\n\n\
+             Details from iperf3:\n{raw}"
+        )
+    } else if lower.contains("no route to host") || lower.contains("network is unreachable") {
+        format!(
+            "The network path to {server} is unreachable.\n\
+             Check that the host address is correct and that your machine has a \
+             route to it (VPN, correct network, etc.).\n\n\
+             Details from iperf3:\n{raw}"
+        )
+    } else if lower.contains("unable to connect to server") || lower.contains("connection refused")
+    {
+        format!(
+            "Could not connect to {server}:{port}.\n\
+             Make sure an iperf3 server is running on that host and port, \
+             and that no firewall is blocking the connection.\n\n\
+             Details from iperf3:\n{raw}"
+        )
+    } else if lower.contains("control socket has closed") || lower.contains("connection reset") {
+        format!(
+            "The iperf3 server closed the connection unexpectedly.\n\
+             The server may have been stopped or rejected the test parameters.\n\n\
+             Details from iperf3:\n{raw}"
+        )
+    } else {
+        raw.to_string()
+    }
 }
 
 pub fn run_test(config: IperfConfig, sender: Sender<TestEvent>, cancel: Arc<AtomicBool>) {
@@ -61,13 +112,26 @@ fn run_test_internal(
             &config.port.to_string(),
             "-t",
             &config.duration_seconds.to_string(),
+            // Report once per second, and flush stdout after every
+            // interval so results stream live through the pipe instead
+            // of arriving buffered at the end.
             "-i",
             "1",
+            "--forceflush",
         ])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|error| format!("Failed to start iperf3 '{}': {}", config.executable, error))?;
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                format!(
+                    "iperf3 was not found at '{}'. Install iperf3 or set the correct path.",
+                    config.executable
+                )
+            } else {
+                format!("Failed to start iperf3 '{}': {}", config.executable, error)
+            }
+        })?;
 
     let _ = sender.send(TestEvent::Started);
 
@@ -141,10 +205,7 @@ fn run_test_internal(
                         return Err(format!("iperf3 exited with non-zero status: {}", status));
                     }
 
-                    return Err(format!(
-                        "iperf3 exited with non-zero status: {}\n{}",
-                        status, details
-                    ));
+                    return Err(friendly_error(&details, &config.server, config.port));
                 }
 
                 let mut summary = TestSummary::default();
@@ -196,24 +257,28 @@ fn parse_summary_line(line: &str, summary: &mut TestSummary) {
     let transfer_value = parts.get(4).and_then(|value| value.parse::<f64>().ok());
     let transfer_unit = parts.get(5).copied();
 
-    if let (Some(value), Some(unit)) = (transfer_value, transfer_unit) {
-        if let Some(bytes) = bytes_from_unit(value, unit) {
-            summary.total_bytes = Some(bytes);
+    if let (Some(value), Some(unit)) = (transfer_value, transfer_unit)
+        && let Some(bytes) = bytes_from_unit(value, unit)
+    {
+        if is_sender {
+            summary.sent_bytes = Some(bytes);
+        } else {
+            summary.received_bytes = Some(bytes);
         }
     }
 
     let bitrate_value = parts.get(6).and_then(|value| value.parse::<f64>().ok());
     let bitrate_unit = parts.get(7).copied();
 
-    if let (Some(value), Some(unit)) = (bitrate_value, bitrate_unit) {
-        if let Some(bits_per_second) = bits_per_second_from_unit(value, unit) {
-            if is_sender {
-                summary.sender_bits_per_second = Some(bits_per_second);
-            }
+    if let (Some(value), Some(unit)) = (bitrate_value, bitrate_unit)
+        && let Some(bits_per_second) = bits_per_second_from_unit(value, unit)
+    {
+        if is_sender {
+            summary.sender_bits_per_second = Some(bits_per_second);
+        }
 
-            if is_receiver {
-                summary.receiver_bits_per_second = Some(bits_per_second);
-            }
+        if is_receiver {
+            summary.receiver_bits_per_second = Some(bits_per_second);
         }
     }
 
@@ -222,26 +287,322 @@ fn parse_summary_line(line: &str, summary: &mut TestSummary) {
     }
 }
 
-fn bytes_from_unit(value: f64, unit: &str) -> Option<u64> {
-    let multiplier = match unit {
-        "Bytes" => 1.0,
-        "KBytes" => 1024.0,
-        "MBytes" => 1024.0 * 1024.0,
-        "GBytes" => 1024.0 * 1024.0 * 1024.0,
-        _ => return None,
-    };
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::iperf::resolve_iperf3;
+    use std::process::Child;
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
 
-    Some((value * multiplier) as u64)
-}
+    #[test]
+    fn parses_sender_summary_line() {
+        let mut summary = TestSummary::default();
 
-fn bits_per_second_from_unit(value: f64, unit: &str) -> Option<f64> {
-    let multiplier = match unit {
-        "bits/sec" => 1.0,
-        "Kbits/sec" => 1_000.0,
-        "Mbits/sec" => 1_000_000.0,
-        "Gbits/sec" => 1_000_000_000.0,
-        _ => return None,
-    };
+        parse_summary_line(
+            "[  5]   0.00-10.00  sec  11.0 MBytes  9.25 Mbits/sec    0             sender",
+            &mut summary,
+        );
 
-    Some(value * multiplier)
+        assert_eq!(summary.sender_bits_per_second, Some(9_250_000.0));
+        assert_eq!(summary.sent_bytes, Some(11 * 1024 * 1024));
+        assert_eq!(summary.retransmits, Some(0));
+        assert_eq!(summary.receiver_bits_per_second, None);
+        assert_eq!(summary.received_bytes, None);
+    }
+
+    #[test]
+    fn parses_receiver_summary_line() {
+        let mut summary = TestSummary::default();
+
+        parse_summary_line(
+            "[  5]   0.00-10.00  sec  10.8 MBytes  9.03 Mbits/sec                  receiver",
+            &mut summary,
+        );
+
+        assert_eq!(summary.receiver_bits_per_second, Some(9_030_000.0));
+        assert_eq!(
+            summary.received_bytes,
+            Some((10.8 * 1024.0 * 1024.0) as u64)
+        );
+        assert_eq!(summary.sender_bits_per_second, None);
+        assert_eq!(summary.retransmits, None);
+    }
+
+    #[test]
+    fn ignores_non_summary_lines() {
+        let mut summary = TestSummary::default();
+
+        parse_summary_line(
+            "[ ID] Interval           Transfer     Bitrate         Retr",
+            &mut summary,
+        );
+        parse_summary_line("iperf Done.", &mut summary);
+        parse_summary_line("", &mut summary);
+
+        assert_eq!(summary.sender_bits_per_second, None);
+        assert_eq!(summary.receiver_bits_per_second, None);
+    }
+
+    #[test]
+    fn friendly_error_maps_connection_refused() {
+        let message = friendly_error(
+            "iperf3: error - unable to connect to server: Connection refused",
+            "example.com",
+            5201,
+        );
+
+        assert!(message.contains("Could not connect to example.com:5201"));
+        assert!(message.contains("iperf3 server is running"));
+    }
+
+    #[test]
+    fn friendly_error_maps_dns_failure() {
+        let message = friendly_error(
+            "iperf3: error - unable to connect to server: Name or service not known",
+            "no-such-host",
+            5201,
+        );
+
+        assert!(message.contains("Could not resolve"));
+        assert!(message.contains("no-such-host"));
+    }
+
+    #[test]
+    fn friendly_error_passes_through_unknown_errors() {
+        let raw = "iperf3: error - some exotic failure";
+
+        assert_eq!(friendly_error(raw, "h", 1), raw);
+    }
+
+    #[test]
+    fn resolve_prefers_existing_custom_path() {
+        let dir = std::env::temp_dir();
+        let fake = dir.join("voyis-test-iperf3-binary");
+
+        std::fs::write(&fake, b"fake").unwrap();
+
+        let resolved = resolve_iperf3(Some(fake.to_string_lossy().as_ref()));
+
+        assert_eq!(resolved, Some(fake.clone()));
+
+        std::fs::remove_file(&fake).ok();
+    }
+
+    #[test]
+    fn resolve_rejects_missing_custom_path() {
+        let resolved = resolve_iperf3(Some("/definitely/not/here/iperf3"));
+
+        // Falls through to bundled copy / PATH; must not return the
+        // missing custom path itself.
+        assert_ne!(
+            resolved,
+            Some(std::path::PathBuf::from("/definitely/not/here/iperf3"))
+        );
+    }
+
+    // --- Integration tests against a real iperf3 binary --------------------
+    // These are skipped with a notice when iperf3 is not installed.
+
+    fn iperf3_binary() -> Option<String> {
+        resolve_iperf3(None).map(|path| path.to_string_lossy().to_string())
+    }
+
+    fn spawn_server(binary: &str, port: u16) -> Option<Child> {
+        Command::new(binary)
+            .args(["-s", "-p", &port.to_string(), "-1"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .ok()
+    }
+
+    fn collect_events(receiver: &mpsc::Receiver<TestEvent>, timeout: Duration) -> Vec<TestEvent> {
+        let deadline = Instant::now() + timeout;
+        let mut events = Vec::new();
+
+        while Instant::now() < deadline {
+            match receiver.recv_timeout(Duration::from_millis(200)) {
+                Ok(event) => {
+                    let terminal = matches!(
+                        event,
+                        TestEvent::Finished(_) | TestEvent::Error(_) | TestEvent::Cancelled
+                    );
+                    events.push(event);
+                    if terminal {
+                        break;
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            }
+        }
+
+        events
+    }
+
+    #[test]
+    fn live_run_reports_intervals_and_summary() {
+        let Some(binary) = iperf3_binary() else {
+            eprintln!("skipping: iperf3 not installed");
+            return;
+        };
+
+        let port = 52991;
+        let mut server = spawn_server(&binary, port).expect("failed to start iperf3 server");
+        thread::sleep(Duration::from_millis(500));
+
+        let (sender, receiver) = mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        let config = IperfConfig {
+            executable: binary,
+            server: "127.0.0.1".to_string(),
+            port,
+            duration_seconds: 3,
+        };
+
+        thread::spawn(move || run_test(config, sender, cancel));
+
+        let events = collect_events(&receiver, Duration::from_secs(20));
+        let _ = server.wait();
+
+        let intervals = events
+            .iter()
+            .filter(|event| matches!(event, TestEvent::Throughput(_)))
+            .count();
+
+        assert!(
+            intervals >= 2,
+            "expected live interval events, got {intervals}"
+        );
+
+        let summary = events.iter().find_map(|event| match event {
+            TestEvent::Finished(summary) => Some(summary),
+            _ => None,
+        });
+
+        let summary = summary.expect("expected Finished event");
+
+        assert!(
+            summary.sender_bits_per_second.unwrap_or(0.0) > 0.0,
+            "expected positive sender bitrate"
+        );
+        assert!(
+            summary.receiver_bits_per_second.unwrap_or(0.0) > 0.0,
+            "expected positive receiver bitrate"
+        );
+        assert!(
+            summary.sent_bytes.unwrap_or(0) > 0,
+            "expected positive sent bytes"
+        );
+    }
+
+    #[test]
+    fn cancel_stops_test_and_leaves_no_process() {
+        let Some(binary) = iperf3_binary() else {
+            eprintln!("skipping: iperf3 not installed");
+            return;
+        };
+
+        let port = 52992;
+        let mut server = spawn_server(&binary, port).expect("failed to start iperf3 server");
+        thread::sleep(Duration::from_millis(500));
+
+        let (sender, receiver) = mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = Arc::clone(&cancel);
+
+        let config = IperfConfig {
+            executable: binary.clone(),
+            server: "127.0.0.1".to_string(),
+            port,
+            duration_seconds: 60,
+        };
+
+        thread::spawn(move || run_test(config, sender, worker_cancel));
+
+        // Wait for the first live sample, then cancel.
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let mut saw_sample = false;
+        while Instant::now() < deadline {
+            match receiver.recv_timeout(Duration::from_millis(200)) {
+                Ok(TestEvent::Throughput(_)) => {
+                    saw_sample = true;
+                    break;
+                }
+                Ok(_) => continue,
+                Err(_) => continue,
+            }
+        }
+        assert!(
+            saw_sample,
+            "expected at least one live sample before cancelling"
+        );
+
+        cancel.store(true, Ordering::Relaxed);
+
+        let events = collect_events(&receiver, Duration::from_secs(15));
+        let _ = server.wait();
+
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, TestEvent::Cancelled)),
+            "expected Cancelled event"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, TestEvent::Finished(_))),
+            "cancelled test must not report Finished"
+        );
+
+        // No iperf3 client process may be left running.
+        thread::sleep(Duration::from_millis(500));
+        let leftover = Command::new("pgrep")
+            .args(["-f", &format!("iperf3.*-p {port}")])
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false);
+
+        assert!(!leftover, "iperf3 client process left running after cancel");
+    }
+
+    #[test]
+    fn refused_connection_produces_friendly_error() {
+        let Some(binary) = iperf3_binary() else {
+            eprintln!("skipping: iperf3 not installed");
+            return;
+        };
+
+        // Nothing listens on this port.
+        let port = 52993;
+
+        let (sender, receiver) = mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        let config = IperfConfig {
+            executable: binary,
+            server: "127.0.0.1".to_string(),
+            port,
+            duration_seconds: 3,
+        };
+
+        thread::spawn(move || run_test(config, sender, cancel));
+
+        let events = collect_events(&receiver, Duration::from_secs(20));
+
+        let error = events.iter().find_map(|event| match event {
+            TestEvent::Error(message) => Some(message),
+            _ => None,
+        });
+
+        let error = error.expect("expected Error event");
+
+        assert!(
+            error.contains("Could not connect to 127.0.0.1:52993"),
+            "expected friendly connection error, got: {error}"
+        );
+    }
 }
