@@ -7,6 +7,7 @@ use std::sync::{
     mpsc::{self, Receiver},
 };
 use std::thread;
+use std::time::{Duration, Instant};
 
 use eframe::egui;
 use egui_plot::{Line, Plot, PlotPoints};
@@ -37,6 +38,9 @@ struct NetworkSpeedApp {
     receiver_mbps: Option<f64>,
     total_bytes: Option<u64>,
     retransmits: Option<u64>,
+
+    test_started_at: Option<Instant>,
+    elapsed_seconds: f64,
 }
 
 impl Default for NetworkSpeedApp {
@@ -45,6 +49,7 @@ impl Default for NetworkSpeedApp {
             server: "127.0.0.1".to_string(),
             port: "5201".to_string(),
             duration: "10".to_string(),
+
             iperf3_path: "iperf3".to_string(),
             iperf3_version: detect_iperf3("iperf3").ok(),
 
@@ -63,6 +68,9 @@ impl Default for NetworkSpeedApp {
             receiver_mbps: None,
             total_bytes: None,
             retransmits: None,
+
+            test_started_at: None,
+            elapsed_seconds: 0.0,
         }
     }
 }
@@ -76,14 +84,36 @@ impl NetworkSpeedApp {
         }
     }
 
+    fn format_bytes(bytes: u64) -> String {
+        const KB: f64 = 1024.0;
+        const MB: f64 = 1024.0 * 1024.0;
+        const GB: f64 = 1024.0 * 1024.0 * 1024.0;
+
+        let value = bytes as f64;
+
+        if value >= GB {
+            format!("{:.2} GB", value / GB)
+        } else if value >= MB {
+            format!("{:.2} MB", value / MB)
+        } else if value >= KB {
+            format!("{:.2} KB", value / KB)
+        } else {
+            format!("{} bytes", bytes)
+        }
+    }
+
     fn reset_results(&mut self) {
         self.samples.clear();
         self.current_mbps = 0.0;
+
         self.sender_mbps = None;
         self.receiver_mbps = None;
         self.total_bytes = None;
         self.retransmits = None;
+
         self.error = None;
+        self.elapsed_seconds = 0.0;
+        self.test_started_at = None;
     }
 
     fn validate(&mut self) -> Option<(u16, u32)> {
@@ -117,6 +147,7 @@ impl NetworkSpeedApp {
 
         Some((port, duration))
     }
+
     fn start_test(&mut self) {
         let Some((port, duration)) = self.validate() else {
             return;
@@ -144,6 +175,7 @@ impl NetworkSpeedApp {
         self.cancel = Some(cancel);
         self.status = "Starting...".to_string();
         self.running = true;
+        self.test_started_at = Some(Instant::now());
     }
 
     fn cancel_test(&mut self) {
@@ -167,7 +199,6 @@ impl NetworkSpeedApp {
 
                 TestEvent::Throughput(sample) => {
                     self.current_mbps = sample.bits_per_second / 1_000_000.0;
-
                     self.samples.push(sample);
                 }
 
@@ -204,124 +235,383 @@ impl NetworkSpeedApp {
             }
         }
     }
+
+    fn update_elapsed(&mut self) {
+        if self.running {
+            if let Some(started) = self.test_started_at {
+                self.elapsed_seconds = started.elapsed().as_secs_f64();
+            }
+        }
+    }
+
+    fn status_color(&self) -> egui::Color32 {
+        match self.status.as_str() {
+            "Running" => egui::Color32::from_rgb(46, 204, 113),
+            "Finished" => egui::Color32::from_rgb(52, 152, 219),
+            "Error" => egui::Color32::from_rgb(231, 76, 60),
+            "Cancelled" | "Cancelling..." => egui::Color32::from_rgb(241, 196, 15),
+            _ => egui::Color32::GRAY,
+        }
+    }
+
+    fn card_frame() -> egui::Frame {
+        egui::Frame::group(&egui::Style::default()).inner_margin(egui::Margin::same(12))
+    }
+
+    fn show_header(&self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.heading(egui::RichText::new("VOYIS").strong().size(24.0));
+
+            ui.separator();
+
+            ui.label(
+                egui::RichText::new("Network Speed Test")
+                    .size(20.0)
+                    .strong(),
+            );
+
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.horizontal(|ui| {
+                    ui.colored_label(self.status_color(), egui::RichText::new("●").size(14.0));
+
+                    ui.label(egui::RichText::new(&self.status).strong());
+                });
+            });
+        });
+    }
+
+    fn show_configuration(&mut self, ui: &mut egui::Ui) {
+        ui.heading(
+            egui::RichText::new("Test Configuration")
+                .size(17.0)
+                .strong(),
+        );
+
+        ui.add_space(8.0);
+
+        ui.add_enabled_ui(!self.running, |ui| {
+            egui::Grid::new("configuration_grid")
+                .num_columns(2)
+                .spacing([12.0, 10.0])
+                .show(ui, |ui| {
+                    ui.label("Server");
+                    ui.add(egui::TextEdit::singleline(&mut self.server).desired_width(210.0));
+                    ui.end_row();
+
+                    ui.label("Port");
+                    ui.add(egui::TextEdit::singleline(&mut self.port).desired_width(210.0));
+                    ui.end_row();
+
+                    ui.label("Duration");
+                    ui.horizontal(|ui| {
+                        ui.add(egui::TextEdit::singleline(&mut self.duration).desired_width(80.0));
+                        ui.label("seconds");
+                    });
+                    ui.end_row();
+
+                    ui.label("iperf3");
+                    ui.add(egui::TextEdit::singleline(&mut self.iperf3_path).desired_width(210.0));
+                    ui.end_row();
+                });
+        });
+
+        ui.add_space(8.0);
+
+        if let Some(version) = &self.iperf3_version {
+            ui.label(egui::RichText::new(version).small().weak());
+        } else {
+            ui.colored_label(egui::Color32::from_rgb(231, 76, 60), "iperf3 not detected");
+        }
+
+        ui.add_space(10.0);
+
+        if !self.running {
+            if ui
+                .add_sized(
+                    [140.0, 34.0],
+                    egui::Button::new(egui::RichText::new("▶  Start Test").strong()),
+                )
+                .clicked()
+            {
+                self.start_test();
+            }
+        } else if ui
+            .add_sized(
+                [140.0, 34.0],
+                egui::Button::new(egui::RichText::new("■  Cancel").strong()),
+            )
+            .clicked()
+        {
+            self.cancel_test();
+        }
+    }
+
+    fn show_current_speed(&self, ui: &mut egui::Ui) {
+        ui.heading(egui::RichText::new("Current Speed").size(17.0).strong());
+
+        ui.add_space(10.0);
+
+        if self.samples.is_empty() {
+            ui.vertical_centered(|ui| {
+                ui.label(egui::RichText::new("0.00 Mbps").size(34.0).strong());
+
+                ui.add_space(4.0);
+
+                ui.label(egui::RichText::new("Waiting for throughput data...").weak());
+            });
+        } else {
+            ui.vertical_centered(|ui| {
+                ui.label(
+                    egui::RichText::new(Self::format_speed(self.current_mbps))
+                        .size(36.0)
+                        .strong(),
+                );
+
+                ui.add_space(4.0);
+
+                ui.label(egui::RichText::new("Live throughput").weak());
+
+                ui.add_space(10.0);
+
+                let live_bytes: u64 = self
+                    .samples
+                    .iter()
+                    .map(|sample| sample.transfer_bytes)
+                    .sum();
+
+                let live_retransmits: u64 = self
+                    .samples
+                    .iter()
+                    .filter_map(|sample| sample.retransmits)
+                    .sum();
+
+                ui.label(
+                    egui::RichText::new(format!(
+                        "{} transferred  •  {} retransmits",
+                        Self::format_bytes(live_bytes),
+                        live_retransmits
+                    ))
+                    .small()
+                    .weak(),
+                );
+            });
+        }
+
+        if self.running {
+            ui.add_space(12.0);
+
+            let duration = self.duration.parse::<f32>().unwrap_or(1.0);
+            let progress = (self.elapsed_seconds as f32 / duration).clamp(0.0, 1.0);
+
+            ui.add(
+                egui::ProgressBar::new(progress)
+                    .desired_width(260.0)
+                    .text(format!("{:.1}s / {}s", self.elapsed_seconds, self.duration)),
+            );
+        }
+    }
+
+    fn show_graph(&self, ui: &mut egui::Ui) {
+        ui.heading(egui::RichText::new("Live Throughput").size(17.0).strong());
+
+        ui.add_space(6.0);
+
+        if self.samples.is_empty() {
+            ui.allocate_ui_with_layout(
+                egui::vec2(ui.available_width(), 260.0),
+                egui::Layout::centered_and_justified(egui::Direction::TopDown),
+                |ui| {
+                    ui.label(
+                        egui::RichText::new(
+                            "No throughput samples yet.\n\n\
+                           Start a test to see live network performance.",
+                        )
+                        .size(15.0)
+                        .color(ui.visuals().text_color()),
+                    );
+                },
+            );
+
+            return;
+        }
+
+        let points: PlotPoints = self
+            .samples
+            .iter()
+            .map(|sample| {
+                [
+                    (sample.start_seconds + sample.end_seconds) / 2.0,
+                    sample.bits_per_second / 1_000_000.0,
+                ]
+            })
+            .collect();
+
+        let line = Line::new("Throughput", points);
+
+        Plot::new("throughput_plot")
+            .height(260.0)
+            .x_axis_label("Time (seconds)")
+            .y_axis_label("Mbps")
+            .allow_zoom(false)
+            .allow_drag(false)
+            .show(ui, |plot_ui| {
+                plot_ui.line(line);
+            });
+    }
+
+    fn show_results(&self, ui: &mut egui::Ui) {
+        ui.heading(egui::RichText::new("Results").size(17.0).strong());
+
+        ui.add_space(8.0);
+
+        // Fall back to values calculated from live samples.
+        let live_bytes: u64 = self
+            .samples
+            .iter()
+            .map(|sample| sample.transfer_bytes)
+            .sum();
+
+        let live_retransmits: u64 = self
+            .samples
+            .iter()
+            .filter_map(|sample| sample.retransmits)
+            .sum();
+
+        let sender = self.sender_mbps.map(Self::format_speed).unwrap_or_else(|| {
+            if self.samples.is_empty() {
+                "—".to_string()
+            } else {
+                "Calculating...".to_string()
+            }
+        });
+
+        let receiver = self
+            .receiver_mbps
+            .map(Self::format_speed)
+            .unwrap_or_else(|| {
+                if self.samples.is_empty() {
+                    "—".to_string()
+                } else {
+                    "Calculating...".to_string()
+                }
+            });
+
+        let data = self
+            .total_bytes
+            .map(Self::format_bytes)
+            .unwrap_or_else(|| Self::format_bytes(live_bytes));
+
+        let retransmits = self
+            .retransmits
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| live_retransmits.to_string());
+
+        ui.columns(4, |columns| {
+            self.result_card(&mut columns[0], "SENDER", sender);
+            self.result_card(&mut columns[1], "RECEIVER", receiver);
+            self.result_card(&mut columns[2], "DATA", data);
+            self.result_card(&mut columns[3], "RETRANSMITS", retransmits);
+        });
+
+        if let Some(error) = &self.error {
+            ui.add_space(8.0);
+
+            ui.colored_label(
+                egui::Color32::from_rgb(231, 76, 60),
+                format!("Error: {}", error),
+            );
+        }
+    }
+
+    fn result_card(&self, ui: &mut egui::Ui, title: &str, value: String) {
+        egui::Frame::group(ui.style())
+            .inner_margin(egui::Margin::same(12))
+            .show(ui, |ui| {
+                ui.vertical_centered(|ui| {
+                    ui.label(
+                        egui::RichText::new(title)
+                            .size(12.0)
+                            .strong()
+                            .color(ui.visuals().text_color()),
+                    );
+
+                    ui.add_space(6.0);
+
+                    ui.label(
+                        egui::RichText::new(value)
+                            .size(20.0)
+                            .strong()
+                            .color(ui.visuals().text_color()),
+                    );
+                });
+            });
+    }
 }
 
 impl eframe::App for NetworkSpeedApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.process_events();
+        self.update_elapsed();
 
-        ui.ctx().request_repaint();
-
-        ui.heading("Network Speed Test");
-
-        ui.add_space(10.0);
-
-        ui.horizontal(|ui| {
-            ui.label("Server:");
-
-            ui.text_edit_singleline(&mut self.server);
-        });
-
-        ui.horizontal(|ui| {
-            ui.label("Port:");
-
-            ui.text_edit_singleline(&mut self.port);
-        });
-
-        ui.horizontal(|ui| {
-            ui.label("Duration:");
-
-            ui.text_edit_singleline(&mut self.duration);
-
-            ui.label("seconds");
-        });
-
-        ui.horizontal(|ui| {
-            ui.label("iperf3 path:");
-
-            ui.text_edit_singleline(&mut self.iperf3_path);
-        });
-        if let Some(version) = &self.iperf3_version {
-            ui.label(format!("Detected: {}", version));
-        } else {
-            ui.label("iperf3: Not detected");
+        if self.running {
+            ui.ctx().request_repaint_after(Duration::from_millis(100));
         }
 
-        ui.add_space(10.0);
+        ui.add_space(12.0);
 
-        ui.horizontal(|ui| {
-            if !self.running {
-                if ui.button("Start Test").clicked() {
-                    self.start_test();
-                }
-            } else if ui.button("Cancel").clicked() {
-                self.cancel_test();
-            }
+        self.show_header(ui);
 
-            ui.label(format!("Status: {}", self.status));
-        });
+        ui.add_space(12.0);
 
         ui.separator();
 
-        ui.heading("Live Throughput");
+        ui.add_space(12.0);
 
-        ui.label(format!(
-            "Current: {}",
-            Self::format_speed(self.current_mbps)
-        ));
-
-        if !self.samples.is_empty() {
-            let points: PlotPoints = self
-                .samples
-                .iter()
-                .map(|sample| [sample.end_seconds, sample.bits_per_second / 1_000_000.0])
-                .collect();
-
-            let line = Line::new("Throughput", points);
-
-            Plot::new("throughput_plot")
-                .height(250.0)
-                .x_axis_label("Time (seconds)")
-                .y_axis_label("Mbps")
-                .show(ui, |plot_ui| {
-                    plot_ui.line(line);
+        ui.columns(2, |columns| {
+            egui::Frame::group(columns[0].style())
+                .inner_margin(egui::Margin::same(14))
+                .show(&mut columns[0], |ui| {
+                    self.show_configuration(ui);
                 });
-        }
+
+            egui::Frame::group(columns[1].style())
+                .inner_margin(egui::Margin::same(14))
+                .show(&mut columns[1], |ui| {
+                    self.show_current_speed(ui);
+                });
+        });
+
+        ui.add_space(14.0);
+
+        self.show_graph(ui);
+
+        ui.add_space(12.0);
 
         ui.separator();
 
-        ui.heading("Summary");
+        ui.add_space(10.0);
 
-        if let Some(value) = self.sender_mbps {
-            ui.label(format!("Sender: {}", Self::format_speed(value)));
-        }
+        self.show_results(ui);
 
-        if let Some(value) = self.receiver_mbps {
-            ui.label(format!("Receiver: {}", Self::format_speed(value)));
-        }
-
-        if let Some(bytes) = self.total_bytes {
-            ui.label(format!("Total data: {} bytes", bytes));
-        }
-
-        if let Some(retransmits) = self.retransmits {
-            ui.label(format!("Retransmits: {}", retransmits));
-        }
-
-        if let Some(error) = &self.error {
-            ui.separator();
-
-            ui.colored_label(egui::Color32::RED, format!("Error: {}", error));
-        }
+        ui.add_space(12.0);
     }
 }
 
 fn main() -> eframe::Result<()> {
-    let options = eframe::NativeOptions::default();
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([1000.0, 750.0])
+            .with_min_inner_size([900.0, 650.0]),
+        ..Default::default()
+    };
 
     eframe::run_native(
         "Voyis Network Speed Test",
         options,
-        Box::new(|_cc| Ok(Box::new(NetworkSpeedApp::default()))),
+        Box::new(|cc| {
+            cc.egui_ctx.set_visuals(egui::Visuals::light());
+
+            Ok(Box::new(NetworkSpeedApp::default()))
+        }),
     )
 }

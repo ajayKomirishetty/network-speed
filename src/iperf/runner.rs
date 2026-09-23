@@ -1,11 +1,12 @@
 use std::io::{BufRead, BufReader};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
     mpsc::Sender,
 };
 use std::thread;
+use std::time::Duration;
 
 use crate::iperf::parser::parse_interval;
 use crate::models::{TestEvent, TestSummary};
@@ -75,13 +76,21 @@ fn run_test_internal(
         .take()
         .ok_or_else(|| "Failed to capture iperf3 stdout".to_string())?;
 
+    let stdout_sender = sender.clone();
+
     let stdout_thread = thread::spawn(move || {
         let reader = BufReader::new(stdout);
+        let mut lines = Vec::new();
 
-        reader
-            .lines()
-            .filter_map(Result::ok)
-            .collect::<Vec<String>>()
+        for line in reader.lines().map_while(Result::ok) {
+            if let Some(sample) = parse_interval(&line) {
+                let _ = stdout_sender.send(TestEvent::Throughput(sample));
+            }
+
+            lines.push(line);
+        }
+
+        lines
     });
 
     let stderr = child
@@ -94,11 +103,12 @@ fn run_test_internal(
 
         reader
             .lines()
-            .filter_map(Result::ok)
+            .map_while(Result::ok)
             .collect::<Vec<String>>()
     });
 
-    // Poll the process while checking for cancellation.
+    // Monitor the process independently so cancellation does not
+    // have to wait for the iperf3 duration to finish.
     loop {
         if cancel.load(Ordering::Relaxed) {
             let _ = child.kill();
@@ -117,19 +127,11 @@ fn run_test_internal(
                 let stdout_lines = stdout_thread.join().unwrap_or_default();
                 let stderr_lines = stderr_thread.join().unwrap_or_default();
 
+                // Cancellation could happen at almost exactly the same
+                // time that iperf3 exits.
                 if cancel.load(Ordering::Relaxed) {
                     let _ = sender.send(TestEvent::Cancelled);
                     return Ok(());
-                }
-
-                let mut summary = TestSummary::default();
-
-                for line in stdout_lines {
-                    if let Some(sample) = parse_interval(&line) {
-                        let _ = sender.send(TestEvent::Throughput(sample));
-                    }
-
-                    parse_summary_line(&line, &mut summary);
                 }
 
                 if !status.success() {
@@ -145,13 +147,19 @@ fn run_test_internal(
                     ));
                 }
 
+                let mut summary = TestSummary::default();
+
+                for line in stdout_lines {
+                    parse_summary_line(&line, &mut summary);
+                }
+
                 let _ = sender.send(TestEvent::Finished(summary));
 
                 return Ok(());
             }
 
             Ok(None) => {
-                thread::sleep(std::time::Duration::from_millis(50));
+                thread::sleep(Duration::from_millis(50));
             }
 
             Err(error) => {
@@ -170,7 +178,7 @@ fn run_test_internal(
 fn parse_summary_line(line: &str, summary: &mut TestSummary) {
     let parts: Vec<&str> = line.split_whitespace().collect();
 
-    if parts.len() < 7 {
+    if parts.len() < 8 {
         return;
     }
 
@@ -178,39 +186,27 @@ fn parse_summary_line(line: &str, summary: &mut TestSummary) {
         return;
     }
 
-    if parts.contains(&"sender") || parts.contains(&"receiver") {
-        let is_sender = parts.contains(&"sender");
-        let is_receiver = parts.contains(&"receiver");
+    let is_sender = parts.contains(&"sender");
+    let is_receiver = parts.contains(&"receiver");
 
-        let transfer_value = parts.get(4).and_then(|v| v.parse::<f64>().ok());
+    if !is_sender && !is_receiver {
+        return;
+    }
 
-        let transfer_unit = parts.get(5).copied();
+    let transfer_value = parts.get(4).and_then(|value| value.parse::<f64>().ok());
+    let transfer_unit = parts.get(5).copied();
 
-        let bitrate_value = parts.get(6).and_then(|v| v.parse::<f64>().ok());
-
-        let bitrate_unit = parts.get(7).copied();
-
-        if let (Some(value), Some(unit)) = (transfer_value, transfer_unit) {
-            let bytes = match unit {
-                "Bytes" => value,
-                "KBytes" => value * 1024.0,
-                "MBytes" => value * 1024.0 * 1024.0,
-                "GBytes" => value * 1024.0 * 1024.0 * 1024.0,
-                _ => return,
-            };
-
-            summary.total_bytes = Some(bytes as u64);
+    if let (Some(value), Some(unit)) = (transfer_value, transfer_unit) {
+        if let Some(bytes) = bytes_from_unit(value, unit) {
+            summary.total_bytes = Some(bytes);
         }
+    }
 
-        if let (Some(value), Some(unit)) = (bitrate_value, bitrate_unit) {
-            let bits_per_second = match unit {
-                "bits/sec" => value,
-                "Kbits/sec" => value * 1_000.0,
-                "Mbits/sec" => value * 1_000_000.0,
-                "Gbits/sec" => value * 1_000_000_000.0,
-                _ => return,
-            };
+    let bitrate_value = parts.get(6).and_then(|value| value.parse::<f64>().ok());
+    let bitrate_unit = parts.get(7).copied();
 
+    if let (Some(value), Some(unit)) = (bitrate_value, bitrate_unit) {
+        if let Some(bits_per_second) = bits_per_second_from_unit(value, unit) {
             if is_sender {
                 summary.sender_bits_per_second = Some(bits_per_second);
             }
@@ -219,9 +215,33 @@ fn parse_summary_line(line: &str, summary: &mut TestSummary) {
                 summary.receiver_bits_per_second = Some(bits_per_second);
             }
         }
-
-        if is_sender {
-            summary.retransmits = parts.get(8).and_then(|v| v.parse().ok());
-        }
     }
+
+    if is_sender {
+        summary.retransmits = parts.get(8).and_then(|value| value.parse::<u64>().ok());
+    }
+}
+
+fn bytes_from_unit(value: f64, unit: &str) -> Option<u64> {
+    let multiplier = match unit {
+        "Bytes" => 1.0,
+        "KBytes" => 1024.0,
+        "MBytes" => 1024.0 * 1024.0,
+        "GBytes" => 1024.0 * 1024.0 * 1024.0,
+        _ => return None,
+    };
+
+    Some((value * multiplier) as u64)
+}
+
+fn bits_per_second_from_unit(value: f64, unit: &str) -> Option<f64> {
+    let multiplier = match unit {
+        "bits/sec" => 1.0,
+        "Kbits/sec" => 1_000.0,
+        "Mbits/sec" => 1_000_000.0,
+        "Gbits/sec" => 1_000_000_000.0,
+        _ => return None,
+    };
+
+    Some(value * multiplier)
 }
