@@ -13,7 +13,7 @@ take-home assignment.
 
 You don't need Rust, iperf3, or a terminal to evaluate this app.
 
-1. Download **`installer/VoyisNetworkSpeed-Setup.exe`** from this repo.
+1. Download **`installer/VoyisNetworkSpeed-Setup.exe`** from this repo (https://github.com/ajayKomirishetty/network-speed).
 2. Double-click it and install. (Windows SmartScreen may warn that the
    installer isn't code-signed — click **More info → Run anyway**.)
 3. Launch **Voyis Network Speed** from the Start Menu.
