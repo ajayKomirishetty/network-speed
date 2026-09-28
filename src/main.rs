@@ -69,7 +69,7 @@ fn card(ui: &egui::Ui) -> egui::Frame {
         .fill(CARD)
         .stroke(egui::Stroke::new(1.0, CARD_BORDER))
         .corner_radius(egui::CornerRadius::same(14))
-        .inner_margin(egui::Margin::same(20))
+        .inner_margin(egui::Margin::same(14))
 }
 
 fn section_title(text: &str) -> egui::RichText {
@@ -543,7 +543,7 @@ impl NetworkSpeedApp {
         }
 
         ui.label(section_title("Test Configuration"));
-        ui.add_space(12.0);
+        ui.add_space(8.0);
 
         // If the user edits any field after an error, the old error is
         // stale: clear it (and the Error pill) so fixed inputs read as
@@ -561,7 +561,7 @@ impl NetworkSpeedApp {
             if let Some(hint) = self.server_error() {
                 ui.label(egui::RichText::new(hint).small().color(DANGER));
             }
-            ui.add_space(10.0);
+            ui.add_space(6.0);
 
             ui.horizontal(|ui| {
                 ui.vertical(|ui| {
@@ -593,7 +593,7 @@ impl NetworkSpeedApp {
                     }
                 });
             });
-            ui.add_space(10.0);
+            ui.add_space(6.0);
 
             ui.label(field_label("IPERF3 EXECUTABLE"));
             ui.horizontal(|ui| {
@@ -619,7 +619,7 @@ impl NetworkSpeedApp {
             self.clear_error_state();
         }
 
-        ui.add_space(10.0);
+        ui.add_space(6.0);
 
         let custom_path = self.iperf3_path.trim().to_string();
 
@@ -664,7 +664,7 @@ impl NetworkSpeedApp {
             });
         }
 
-        ui.add_space(16.0);
+        ui.add_space(10.0);
 
         if !self.running {
             ui.add_enabled_ui(self.iperf3_found, |ui| {
@@ -676,7 +676,7 @@ impl NetworkSpeedApp {
                 )
                 .fill(ACCENT)
                 .corner_radius(egui::CornerRadius::same(10));
-                if ui.add_sized([ui.available_width(), 46.0], button).clicked() {
+                if ui.add_sized([ui.available_width(), 40.0], button).clicked() {
                     self.start_test();
                 }
             });
@@ -695,7 +695,7 @@ impl NetworkSpeedApp {
             )
             .fill(DANGER)
             .corner_radius(egui::CornerRadius::same(10));
-            if ui.add_sized([ui.available_width(), 46.0], button).clicked() {
+            if ui.add_sized([ui.available_width(), 40.0], button).clicked() {
                 self.cancel_test();
             }
         }
@@ -803,7 +803,6 @@ impl NetworkSpeedApp {
                 .desired_height(22.0)
                 .text(format!("{:.1}s / {}s", elapsed, self.duration))
                 .fill(ACCENT);
-
             ui.add(bar);
         }
     }
@@ -813,20 +812,29 @@ impl NetworkSpeedApp {
 
         ui.add_space(8.0);
 
+        // Scale the chart with the window so it grows on large/fullscreen
+        // displays instead of staying a fixed small strip. Zoom/drag stay
+        // off so the mouse wheel keeps scrolling the page.
+        let window_height = ui
+            .ctx()
+            .input(|i| i.raw.screen_rect.map(|rect| rect.height()))
+            .unwrap_or(750.0);
+        let plot_height = (window_height * 0.28).clamp(150.0, 300.0);
+
         if self.samples.is_empty() {
             ui.allocate_ui_with_layout(
-                egui::vec2(ui.available_width(), 260.0),
-                egui::Layout::centered_and_justified(egui::Direction::TopDown),
-                |ui| {
-                    ui.label(
-                        egui::RichText::new(
-                            "No throughput samples yet.\n\nStart a test to see live network performance.",
-                        )
-                        .size(15.0)
-                        .color(TEXT_DIM),
-                    );
-                },
-            );
+              egui::vec2(ui.available_width(), plot_height),
+              egui::Layout::centered_and_justified(egui::Direction::TopDown),
+              |ui| {
+                  ui.label(
+                      egui::RichText::new(
+                          "No throughput samples yet.\n\nStart a test to see live network performance.",
+                      )
+                      .size(15.0)
+                      .color(TEXT_DIM),
+                  );
+              },
+          );
 
             return;
         }
@@ -845,7 +853,7 @@ impl NetworkSpeedApp {
         let line = Line::new("Throughput", points).color(ACCENT).width(2.5);
 
         Plot::new("throughput_plot")
-            .height(260.0)
+            .height(plot_height)
             .x_axis_label("Time (seconds)")
             .y_axis_label("Mbps")
             .allow_zoom(false)
@@ -874,7 +882,7 @@ impl NetworkSpeedApp {
             }
         });
 
-        ui.add_space(10.0);
+        ui.add_space(6.0);
 
         // Fall back to values calculated from live samples.
         let live_bytes: u64 = self
@@ -952,7 +960,7 @@ impl NetworkSpeedApp {
             .fill(CARD)
             .stroke(egui::Stroke::new(1.0, CARD_BORDER))
             .corner_radius(egui::CornerRadius::same(12))
-            .inner_margin(egui::Margin::same(16))
+            .inner_margin(egui::Margin::same(10))
             .show(ui, |ui| {
                 ui.vertical_centered(|ui| {
                     ui.label(
@@ -962,9 +970,9 @@ impl NetworkSpeedApp {
                             .color(TEXT_DIM),
                     );
 
-                    ui.add_space(10.0);
+                    ui.add_space(6.0);
 
-                    ui.label(egui::RichText::new(value).size(21.0).strong().color(TEXT));
+                    ui.label(egui::RichText::new(value).size(18.0).strong().color(TEXT));
                 });
             });
     }
@@ -979,35 +987,35 @@ impl eframe::App for NetworkSpeedApp {
             ui.ctx().request_repaint_after(Duration::from_millis(100));
         }
 
-        ui.add_space(16.0);
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            ui.add_space(10.0);
 
-        self.show_header(ui);
+            self.show_header(ui);
 
-        ui.add_space(16.0);
+            ui.add_space(10.0);
 
-        ui.columns(2, |columns| {
-            card(&columns[0]).show(&mut columns[0], |ui| {
-                self.show_configuration(ui);
+            ui.columns(2, |columns| {
+                card(&columns[0]).show(&mut columns[0], |ui| {
+                    self.show_configuration(ui);
+                });
+
+                card(&columns[1]).show(&mut columns[1], |ui| {
+                    self.show_current_speed(ui);
+                });
             });
 
-            card(&columns[1]).show(&mut columns[1], |ui| {
-                self.show_current_speed(ui);
+            ui.add_space(10.0);
+
+            card(ui).show(ui, |ui| {
+                self.show_graph(ui);
             });
+
+            ui.add_space(10.0);
+
+            self.show_results(ui);
+
+            ui.add_space(8.0);
         });
-
-        ui.add_space(16.0);
-
-        card(ui).show(ui, |ui| {
-            self.show_graph(ui);
-        });
-
-        ui.add_space(16.0);
-
-        ui.add_space(10.0);
-
-        self.show_results(ui);
-
-        ui.add_space(12.0);
     }
 }
 

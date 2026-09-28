@@ -9,6 +9,36 @@ take-home assignment.
 
 ---
 
+## Try this app in 2 minutes (for reviewers — no setup needed)
+
+You don't need Rust, iperf3, or a terminal to evaluate this app.
+
+1. Download **`installer/VoyisNetworkSpeed-Setup.exe`** from this repo.
+2. Double-click it and install. (Windows SmartScreen may warn that the
+   installer isn't code-signed — click **More info → Run anyway**.)
+3. Launch **Voyis Network Speed** from the Start Menu.
+4. That's it — **iperf3 3.21 is bundled with the installer**, so the app
+   detects it automatically. Nothing else to install.
+
+To run a real end-to-end test with no network needed:
+
+1. Open a terminal and start a local iperf3 server using the bundled binary:
+
+   ```cmd
+   cd "C:\Program Files\Voyis Network Speed"
+   iperf3.exe -s
+   ```
+
+   Leave that window open.
+2. In the app, keep the defaults (**127.0.0.1**, port **5201**) and click
+   **Start Test**.
+3. You'll see live per-second throughput, the chart drawing in real time,
+   and the final sender/receiver summary with export buttons
+   (CSV / JSON / TXT report).
+4. Tip: running a test against `127.0.0.6` (nothing listening) demonstrates
+   the friendly connection-timeout handling — the app reports a clear error
+   after ~10 seconds instead of hanging.
+
 ## How to build and run
 
 ### Prerequisites
